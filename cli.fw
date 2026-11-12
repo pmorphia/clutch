@@ -1,0 +1,6 @@
+# The clutch command: flywheel run cli.fw -- COMMAND ...
+#   up [clutch.cw] | serve [clutch.cw] [port] | check [clutch.cw]
+#   status|start|stop|restart|logs [name] [port] | shutdown [port]
+import clutch
+import os
+return clutch.main(os.args())

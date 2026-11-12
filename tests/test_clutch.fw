@@ -1,0 +1,109 @@
+# flywheel test tests/
+import "../clutch.fw"
+import cogwheel
+import testing
+import fs
+import os
+import time
+
+function quiet returns clutch.Clutch
+    var c = clutch.Clutch()
+    c.verbose = false
+    return c
+end
+
+function test_order_and_cycles
+    var c = quiet()
+    c.add("web", ["true"]).after("api")
+    c.add("api", ["true"]).after("db")
+    c.add("db", ["true"])
+    testing.assert_equal(" ".join(c.order().map(function(clutch.Process p) => p.name)), "db api web")
+    c.process("db").after("web")
+    var e = testing.expect_error(ValueError, function() => c.order())
+    testing.assert(e.message.contains("cycle"))
+    testing.expect_error(ValueError, function() => c.add("db", ["true"]))
+    testing.expect_error(KeyError, function() => c.process("nope"))
+    testing.expect_error(ValueError, function() => c.add("x", ["true"]).restart("sometimes"))
+end
+
+function test_start_stop_and_environment
+    var c = quiet()
+    c.env("SHARED", "yes")
+    var p = c.shell("sleeper", "sleep 30")
+    c.start("sleeper")
+    testing.assert_equal(p.state, "running")
+    testing.assert(os.alive(p.pid))
+    c.stop("sleeper")
+    testing.assert_equal(p.state, "stopped")
+    testing.assert(not os.alive(p.pid))
+    testing.assert_equal(p.exit_status, -15)
+    var stubborn = c.add("stubborn", ["/bin/sh", "-c", "trap '' TERM; sleep 30"]).stop_grace("200ms")
+    c.start("stubborn")
+    time.sleep(0.2)
+    c.stop("stubborn")
+    testing.assert_equal(stubborn.exit_status, -9)
+end
+
+function test_restart_policies
+    var c = quiet()
+    var once = c.add("once", ["true"])
+    var failing = c.add("failing", ["false"]).give_up_after(1)
+    var always = c.add("always", ["true"]).restart("always")
+    var never = c.add("never", ["false"]).restart("never")
+    c.start_all()
+    time.sleep(0.3)
+    c.check()
+    testing.assert_equal(once.state, "exited")
+    testing.assert_equal(never.state, "exited")
+    testing.assert_equal(failing.state, "backoff")
+    testing.assert_equal(always.state, "backoff")
+    failing.retry_at = 0.0
+    always.retry_at = 0.0
+    c.check()
+    testing.assert_equal(failing.restarts, 1)
+    time.sleep(0.3)
+    c.check()
+    testing.assert_equal(failing.state, "failed")
+    testing.assert(failing.message.contains("gave up"))
+    testing.assert_equal(always.state, "backoff")
+    testing.assert_equal(always.backoff, 4.0)
+    c.stop_all()
+end
+
+function test_ready_checks
+    var c = quiet()
+    var marker = fs.join(fs.temp_dir(), "clutch-ready-{os.pid()}")
+    if fs.exists(marker) do
+        fs.remove(marker)
+    end
+    var p = c.shell("maker", "sleep 0.3; touch {marker}; sleep 30").ready_file(marker, "5s")
+    var started = time.monotonic()
+    c.start("maker")
+    testing.assert(time.monotonic() - started >= 0.25)
+    testing.assert_equal(p.state, "running")
+    c.stop_all()
+    fs.remove(marker)
+    var dies = c.add("dies", ["false"]).ready_port(1, "5s")
+    testing.expect_error(ProcessError, function() => c.start("dies"))
+end
+
+function test_configuration_file
+    var doc = cogwheel.parse("# Environment\n\n> A = 1\n\n# Processes\n\n## db\n\n> command = sleep '30'\n\n> grace = 1s\n\n## api\n\n> shell = echo $A\n\n> after = db\n\n> env.PORT = 9000\n\n> restart = always\n\n> autostart = no\n")
+    var c = quiet()
+    testing.assert_equal(clutch.load(c, doc), 2)
+    testing.assert_equal(" ".join(c.process("db").command), "sleep 30")
+    testing.assert_equal(c.process("db").grace, 1.0)
+    var api = c.process("api")
+    testing.assert_equal(api.policy, "always")
+    testing.assert_equal(api.needs[0], "db")
+    testing.assert_equal(api.variables["PORT"], "9000")
+    testing.assert(not api.autostart)
+    testing.assert_equal(c.shared["A"], "1")
+end
+
+function test_helpers
+    testing.assert_equal(clutch.seconds("250ms"), 0.25)
+    testing.assert_equal(clutch.seconds("2m"), 120.0)
+    testing.assert_equal(clutch.format_duration(3725.0), "1h02m")
+    testing.assert_equal(" | ".join(clutch.split_command("run 'a b' \"c\"")), "run | a b | c")
+end

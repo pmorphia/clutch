@@ -1,0 +1,14 @@
+[package]
+name = "clutch"
+author = "danny"
+version = "1.0.0"
+description = "A process manager for Flywheel: start, supervise, and control programs together"
+main = "clutch.fw"
+license = "MIT"
+exclude = ["tests/*", ".gitignore", "logs/*"]
+
+[dependencies]
+cogwheel = "danny.cogwheel=^1.0"
+
+[scripts]
+test = "flywheel test tests/"

@@ -1,0 +1,784 @@
+# Clutch: a process manager for Flywheel. It starts programs in dependency order, waits until
+# each is ready, restarts the ones that stop, and lets you control them over HTTP.
+#
+#     import clutch
+#     var c = clutch.Clutch()
+#     c.add("db", ["redis-server", "--port", "6380"]).ready_port(6380)
+#     c.add("api", ["flywheel", "run", "api.fw"]).after("db").env("REDIS", "127.0.0.1:6380")
+#     c.add("worker", ["flywheel", "run", "worker.fw"]).after("db").restart("always")
+#     c.up()             # start everything and supervise it until it is shut down
+#
+# Processes can also come from a Cogwheel file (clutch.run_file("clutch.cw")). See
+# https://github.com/pmorphia/clutch.
+import cogwheel
+import fs
+import json
+import net
+import os
+import thread
+import time
+import web
+
+# One managed program and what happened to it.
+class Process
+    string name
+    string[] command
+    string directory = ""
+    map<string, string> variables = {}
+    # Output (stdout and stderr) is appended here; "" is the manager's own output.
+    string log_file = ""
+    # "always", "on-failure" (a nonzero exit status), or "never".
+    string policy = "on-failure"
+    string[] needs = []
+    # How to tell it is ready: "" (once started), "port N", "file PATH", or "delay DURATION".
+    string ready_check = ""
+    double ready_timeout = 30.0
+    # Seconds between SIGTERM and SIGKILL when stopping.
+    double grace = 5.0
+    # Give up after this many restarts in a row (0: never give up).
+    int max_restarts = 10
+    bool autostart = true
+
+    # "stopped", "starting", "running", "exited", "backoff", or "failed".
+    string state = "stopped"
+    int pid = 0
+    int exit_status = 0
+    int restarts = 0
+    int starts = 0
+    double started_at = 0.0
+    double stopped_at = 0.0
+    double retry_at = 0.0
+    double backoff = 1.0
+    string message = ""
+
+    function cwd(string path) returns Process
+        this.directory = path
+        return this
+    end
+    function env(string name, string value) returns Process
+        this.variables[name] = value
+        return this
+    end
+    function log(string path) returns Process
+        this.log_file = path
+        return this
+    end
+    function restart(string when) returns Process
+        if not (when in ["always", "on-failure", "never"]) do
+            throw ValueError("restart is always, on-failure, or never, not '{when}'")
+        end
+        this.policy = when
+        return this
+    end
+    function after(string other) returns Process
+        this.needs.push(other)
+        return this
+    end
+    function ready_port(int port, string timeout = "30s") returns Process
+        this.ready_check = "port {port}"
+        this.ready_timeout = seconds(timeout)
+        return this
+    end
+    function ready_file(string path, string timeout = "30s") returns Process
+        this.ready_check = "file " + path
+        this.ready_timeout = seconds(timeout)
+        return this
+    end
+    function ready_after(string delay) returns Process
+        this.ready_check = "delay " + delay
+        return this
+    end
+    function stop_grace(string duration) returns Process
+        this.grace = seconds(duration)
+        return this
+    end
+    function give_up_after(int n) returns Process
+        this.max_restarts = n
+        return this
+    end
+    function manual returns Process
+        this.autostart = false
+        return this
+    end
+
+    function running returns bool
+        return this.state == "running" or this.state == "starting"
+    end
+    function uptime returns double
+        return time.now() - this.started_at if this.running() else 0.0
+    end
+    function line returns string
+        var up = format_duration(this.uptime()) if this.running() else "-"
+        var pid = string(this.pid) if this.running() else "-"
+        var info = this.message
+        if info == "" and this.state == "exited" do
+            info = "exit status {this.exit_status}"
+        end
+        return "{this.name:<16} {this.state:<9} pid {pid:<8} up {up:<9} restarts {this.restarts:<4} {info}"
+    end
+    function snapshot returns Snapshot
+        return Snapshot(this.name, this.state, this.pid if this.running() else 0, this.exit_status, this.restarts, this.uptime(), this.command, this.message)
+    end
+end
+
+# What the control port reports about a process.
+class Snapshot
+    string name
+    string state
+    int pid
+    int exit_status
+    int restarts
+    double uptime
+    string[] command
+    string message
+end
+
+class Clutch
+    Process[] processes = []
+    bool supervising = false
+    # Print a line for every start, exit, and restart.
+    bool verbose = true
+    # Seconds between checks while supervising.
+    double interval = 0.5
+    # Environment variables given to every process.
+    map<string, string> shared = {}
+    thread.mutex lock = thread.mutex()
+    # Called on every change of state: the process and its new state.
+    (function(Process, string) returns void)? on_change = null
+
+    function add(string name, string[] command) returns Process
+        if command.length == 0 do
+            throw ValueError("process '{name}' needs a command")
+        end
+        for p in this.processes do
+            if p.name == name do
+                throw ValueError("clutch already has a process named '{name}'")
+            end
+        end
+        var p = Process(name, command)
+        this.processes.push(p)
+        return p
+    end
+    # A process run with /bin/sh -c (pipes, redirections, variables).
+    function shell(string name, string line) returns Process
+        return this.add(name, ["/bin/sh", "-c", "exec " + line if not line.contains("|") and not line.contains(";") and not line.contains("&") else line])
+    end
+    function env(string name, string value) returns Clutch
+        this.shared[name] = value
+        return this
+    end
+    function process(string name) returns Process
+        for p in this.processes do
+            if p.name == name do
+                return p
+            end
+        end
+        throw KeyError("no process named '{name}'")
+    end
+
+    function say(string text) returns void
+        if this.verbose do
+            print "[clutch {time.format_local(time.now(), "%H:%M:%S")}] {text}"
+        end
+    end
+    function change(Process p, string state, string message = "") returns void
+        p.state = state
+        p.message = message
+        var hook = this.on_change
+        if hook != null do
+            hook(p, state)
+        end
+    end
+
+    # The processes in an order that starts every process after the ones it needs.
+    function order returns Process[]
+        Process[] out = []
+        string[] visiting = []
+        for p in this.processes do
+            this.visit(p, visiting, out)
+        end
+        return out
+    end
+    function visit(Process p, string[] visiting, Process[] out) returns void
+        for done in out do
+            if done.name == p.name do
+                return
+            end
+        end
+        if p.name in visiting do
+            throw ValueError("processes need each other in a cycle: {" -> ".join(visiting)} -> {p.name}")
+        end
+        visiting.push(p.name)
+        for need in p.needs do
+            this.visit(this.process(need), visiting, out)
+        end
+        visiting.pop()
+        out.push(p)
+    end
+
+    # Starts a process (after starting the ones it needs) and waits until it is ready.
+    function start(string name) returns void
+        var p = this.process(name)
+        for need in p.needs do
+            var other = this.process(need)
+            if not other.running() do
+                this.start(need)
+            end
+        end
+        if p.running() do
+            return
+        end
+        this.launch(p)
+        this.wait_ready(p)
+    end
+    function launch(Process p) returns void
+        var proc = os.process(p.command)
+        proc.cwd = p.directory
+        for k, v in this.shared do
+            proc.env[k] = v
+        end
+        for k, v in p.variables do
+            proc.env[k] = v
+        end
+        proc.env["CLUTCH_PROCESS"] = p.name
+        for other in this.processes do
+            if other.running() do
+                proc.env["CLUTCH_PID_" + env_name(other.name)] = string(other.pid)
+            end
+        end
+        if p.log_file != "" do
+            var dir = fs.dirname(p.log_file)
+            if dir != "" and dir != "." and not fs.exists(dir) do
+                fs.mkdir(dir)
+            end
+        end
+        try
+            p.pid = proc.start(p.log_file)
+        catch ProcessError e
+            this.change(p, "failed", e.message)
+            this.say("{p.name}: {e.message}")
+            throw e
+        end
+        p.starts += 1
+        p.started_at = time.now()
+        this.change(p, "starting")
+        this.say("{p.name}: started (pid {p.pid})")
+    end
+    # Waits for a process's ready check; it is "running" afterwards.
+    function wait_ready(Process p) returns void
+        var check = p.ready_check
+        var deadline = time.now() + p.ready_timeout
+        if check.starts_with("delay ") do
+            time.sleep(seconds(check.slice(6)))
+        else if check.starts_with("port ") or check.starts_with("file ") do
+            while true do
+                if not os.alive(p.pid) do
+                    this.reap(p)
+                    throw ProcessError("{p.name} exited before it was ready ({check})")
+                end
+                if is_ready(check) do
+                    break
+                end
+                if time.now() > deadline do
+                    this.say("{p.name}: not ready after {p.ready_timeout:.0f}s ({check}); going on")
+                    break
+                end
+                time.sleep(0.1)
+            end
+        end
+        if p.state == "starting" do
+            this.change(p, "running")
+        end
+    end
+
+    # Stops a process: SIGTERM, then SIGKILL after its grace period. Processes that need it
+    # are stopped first.
+    function stop(string name) returns void
+        var p = this.process(name)
+        for other in this.processes do
+            if p.name in other.needs and other.running() do
+                this.stop(other.name)
+            end
+        end
+        this.halt(p)
+    end
+    function halt(Process p) returns void
+        if not p.running() do
+            if p.state == "backoff" do
+                this.change(p, "stopped")
+            end
+            return
+        end
+        os.kill(p.pid, 15)
+        var deadline = time.now() + p.grace
+        while os.alive(p.pid) and time.now() < deadline do
+            time.sleep(0.05)
+        end
+        if os.alive(p.pid) do
+            os.kill(p.pid, 9)
+        end
+        p.exit_status = os.wait(p.pid)
+        p.stopped_at = time.now()
+        this.change(p, "stopped")
+        this.say("{p.name}: stopped")
+    end
+    function restart_process(string name) returns void
+        var p = this.process(name)
+        this.halt(p)
+        p.restarts = 0
+        p.backoff = 1.0
+        this.start(name)
+    end
+
+    # Starts every process (marked autostart) in dependency order.
+    function start_all returns void
+        for p in this.order() do
+            if p.autostart and not p.running() do
+                this.start(p.name)
+            end
+        end
+    end
+    # Stops every process, the ones that need others first.
+    function stop_all returns void
+        var all = this.order()
+        int i = all.length - 1
+        while i >= 0 do
+            this.halt(all[i])
+            i -= 1
+        end
+    end
+
+    # Records how a process ended.
+    function reap(Process p) returns void
+        p.exit_status = os.wait(p.pid)
+        p.stopped_at = time.now()
+        this.change(p, "exited")
+    end
+
+    # Notices processes that ended and restarts them by their policy, waiting longer after
+    # each quick failure (1s, 2s, 4s, ... 30s). Returns how many changed.
+    function check returns int
+        int changed = 0
+        var now = time.now()
+        for p in this.processes do
+            if p.running() and not os.alive(p.pid) do
+                this.reap(p)
+                changed += 1
+                var ran = p.stopped_at - p.started_at
+                if ran > 30.0 do
+                    p.backoff = 1.0
+                    p.restarts = 0
+                end
+                bool again = p.policy == "always" or (p.policy == "on-failure" and p.exit_status != 0)
+                if not again do
+                    this.say("{p.name}: exited with status {p.exit_status}")
+                    continue
+                end
+                if p.max_restarts > 0 and p.restarts >= p.max_restarts do
+                    this.change(p, "failed", "gave up after {p.restarts} restarts")
+                    this.say("{p.name}: exited with status {p.exit_status}; gave up after {p.restarts} restarts")
+                    continue
+                end
+                p.retry_at = now + p.backoff
+                this.change(p, "backoff", "restarting in {p.backoff:.0f}s")
+                this.say("{p.name}: exited with status {p.exit_status}; restarting in {p.backoff:.0f}s")
+                p.backoff = p.backoff * 2.0 if p.backoff < 16.0 else 30.0
+            else if p.state == "backoff" and now >= p.retry_at do
+                p.restarts += 1
+                changed += 1
+                try
+                    this.launch(p)
+                    this.wait_ready(p)
+                catch Error e
+                    this.say("{p.name}: {e.message}")
+                end
+            end
+        end
+        return changed
+    end
+
+    # Checks the processes every `interval` until shutdown() is called or nothing is left to
+    # watch.
+    function supervise returns void
+        this.supervising = true
+        while this.supervising do
+            this.lock.lock()
+            try
+                this.check()
+            finally
+                this.lock.unlock()
+            end
+            bool any = false
+            for p in this.processes do
+                any = any or p.running() or p.state == "backoff"
+            end
+            if not any do
+                this.say("nothing left running")
+                break
+            end
+            time.sleep(this.interval)
+        end
+        this.supervising = false
+    end
+    function shutdown returns void
+        this.supervising = false
+    end
+
+    # Starts everything and supervises it; stops everything when supervision ends.
+    function up returns void
+        this.start_all()
+        this.supervise()
+        this.stop_all()
+    end
+
+    function status returns string
+        string[] lines = []
+        for p in this.processes do
+            lines.push(p.line())
+        end
+        return "\n".join(lines)
+    end
+    function snapshots returns Snapshot[]
+        return this.processes.map(function(Process p) => p.snapshot())
+    end
+
+    # Supervises on a background thread and answers control requests on a port:
+    #   GET  /status                 every process (JSON)
+    #   GET  /status/:name           one process
+    #   POST /start/:name, /stop/:name, /restart/:name
+    #   GET  /logs/:name?lines=N     the end of a process's log file
+    #   POST /shutdown               stop everything and exit
+    # Only clients on this machine are answered unless host is something else.
+    function serve(int port, string host = "127.0.0.1") returns void
+        this.start_all()
+        var supervisor = spawn this.supervise()
+        var me = this
+        web.serve("/status", function(web.request req) => web.json(json.encode(me.snapshots())), port, host)
+        web.serve("/status/:name", function(web.request req) returns web.response
+            try
+                return web.json(json.encode(me.process(req.params["name"]).snapshot()))
+            catch KeyError e
+                return web.text(e.message, 404)
+            end
+        end, port, host)
+        for action in ["start", "stop", "restart"] do
+            web.route("POST", "/" + action + "/:name", function(web.request req) returns web.response
+                return me.control(action, req.params["name"])
+            end, port, host)
+        end
+        web.serve("/logs/:name", function(web.request req) returns web.response
+            try
+                var p = me.process(req.params["name"])
+                if p.log_file == "" or not fs.exists(p.log_file) do
+                    return web.text("{p.name} has no log file", 404)
+                end
+                var count = int(req.query["lines"]) if "lines" in req.query else 100
+                var lines = fs.read(p.log_file).lines()
+                var from = lines.length - count if lines.length > count else 0
+                return web.text("\n".join(lines.slice(from)) + "\n")
+            catch KeyError e
+                return web.text(e.message, 404)
+            end
+        end, port, host)
+        web.route("POST", "/shutdown", function(web.request req) returns web.response
+            me.shutdown()
+            me.lock.lock()
+            me.stop_all()
+            me.lock.unlock()
+            os.exit(0)
+            return web.text("bye")
+        end, port, host)
+        this.say("control at http://{host}:{port}/status")
+        web.wait()
+        supervisor.join()
+    end
+    function control(string action, string name) returns web.response
+        this.lock.lock()
+        try
+            var p = this.process(name)
+            if action == "start" do
+                if p.state == "failed" or p.state == "exited" do
+                    p.restarts = 0
+                    p.backoff = 1.0
+                end
+                this.start(name)
+            else if action == "stop" do
+                this.stop(name)
+            else do
+                this.restart_process(name)
+            end
+            return web.json(json.encode(p.snapshot()))
+        catch KeyError e
+            return web.text(e.message, 404)
+        catch Error e
+            return web.text(e.message, 500)
+        finally
+            this.lock.unlock()
+        end
+    end
+end
+
+# A client for a clutch serving control requests (clutch.Clutch.serve).
+class Client
+    string base = "http://127.0.0.1:7979"
+
+    function request(string method, string path) returns string
+        map<string, string> headers = {}
+        var r = web.fetch(method, this.base + path, "", headers, 60.0)
+        if r.status >= 400 do
+            throw "ClutchError" with r.body.trim()
+        end
+        return r.body
+    end
+    function status returns Snapshot[]
+        return json.decode<Snapshot[]>(this.request("GET", "/status"))
+    end
+    function start(string name) returns Snapshot
+        return json.decode<Snapshot>(this.request("POST", "/start/" + name))
+    end
+    function stop(string name) returns Snapshot
+        return json.decode<Snapshot>(this.request("POST", "/stop/" + name))
+    end
+    function restart(string name) returns Snapshot
+        return json.decode<Snapshot>(this.request("POST", "/restart/" + name))
+    end
+    function logs(string name, int lines = 100) returns string
+        return this.request("GET", "/logs/" + name + "?lines=" + string(lines))
+    end
+    function shutdown returns void
+        try
+            this.request("POST", "/shutdown")
+        catch HttpError e
+            # the manager exits while answering
+        end
+    end
+end
+
+function client(int port = 7979, string host = "127.0.0.1") returns Client
+    return Client("http://{host}:{port}")
+end
+
+# ---------------------------------------------------------------- helpers
+
+private function env_name(string name) returns string
+    string out = ""
+    for c in name.upper() do
+        out += string(c) if (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') else "_"
+    end
+    return out
+end
+
+private function is_ready(string check) returns bool
+    if check.starts_with("file ") do
+        return fs.exists(check.slice(5).trim())
+    end
+    var port = int(check.slice(5).trim())
+    try
+        var socket = net.connect("127.0.0.1", port, 0.5)
+        socket.close()
+        return true
+    catch Error e
+        return false
+    end
+end
+
+# Seconds in a duration: "90", "500ms", "30s", "5m", "2h".
+function seconds(string text) returns double
+    var t = text.trim().lower()
+    if t.ends_with("ms") do
+        return double(t.slice(0, t.length - 2)) / 1000.0
+    end
+    map<string, double> units = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+    var last = t.slice(t.length - 1)
+    if last in units do
+        return double(t.slice(0, t.length - 1)) * units[last]
+    end
+    return double(t)
+end
+
+function format_duration(double s) returns string
+    var n = int(s)
+    if n < 60 do
+        return "{n}s"
+    end
+    if n < 3600 do
+        return "{n // 60}m{n % 60:02}s"
+    end
+    if n < 86400 do
+        return "{n // 3600}h{n % 3600 // 60:02}m"
+    end
+    return "{n // 86400}d{n % 86400 // 3600:02}h"
+end
+
+# Splits a command line into arguments: spaces separate them, quotes group them.
+function split_command(string line) returns string[]
+    string[] out = []
+    string current = ""
+    bool started = false
+    string quote = ""
+    for c in line do
+        var ch = string(c)
+        if quote != "" do
+            if ch == quote do
+                quote = ""
+            else do
+                current += ch
+            end
+        else if ch == "\"" or ch == "'" do
+            quote = ch
+            started = true
+        else if ch == " " or ch == "\t" do
+            if started do
+                out.push(current)
+                current = ""
+                started = false
+            end
+        else do
+            current += ch
+            started = true
+        end
+    end
+    if quote != "" do
+        throw ValueError("unclosed quote in command: {line}")
+    end
+    if started do
+        out.push(current)
+    end
+    return out
+end
+
+# ---------------------------------------------------------------- configuration
+
+# Adds the processes of a Cogwheel document: each section under "# Processes" (or each
+# top-level section) is a process named by its heading, with a command (or shell) entry and
+# optional cwd, log, restart, after (comma-separated), ready (port N, file PATH, delay 2s),
+# ready timeout, grace, max restarts, autostart, and env.NAME entries. Entries of an
+# "# Environment" section go to every process.
+function load(Clutch c, cogwheel.Node doc) returns int
+    if doc.has("#Environment") do
+        for e in doc["#Environment"].entries() do
+            c.env(e.name, e.value)
+        end
+    end
+    var root = doc["#Processes"] if doc.has("#Processes") else doc
+    int added = 0
+    for s in root.sections() do
+        if s.name == "Environment" do
+            continue
+        end
+        Process? made = null
+        if s.has(">shell") do
+            made = c.shell(s.name, s.get("shell"))
+        else if s.has(">command") do
+            made = c.add(s.name, split_command(s.get("command")))
+        else do
+            throw ValueError("process '{s.name}' needs a command or shell entry")
+        end
+        var p = made ?? c.process(s.name)
+        p.directory = s.get_or("cwd", "")
+        p.log_file = s.get_or("log", "")
+        if s.has(">restart") do
+            p.restart(s.get("restart"))
+        end
+        if s.has(">after") do
+            for need in s.get_list("after") do
+                p.after(need)
+            end
+        end
+        p.ready_check = s.get_or("ready", "")
+        if s.has(">ready timeout") do
+            p.ready_timeout = seconds(s.get("ready timeout"))
+        end
+        if s.has(">grace") do
+            p.grace = seconds(s.get("grace"))
+        end
+        if s.has(">max restarts") do
+            p.max_restarts = s.get_int("max restarts")
+        end
+        if s.has(">autostart") do
+            p.autostart = s.get_bool("autostart")
+        end
+        for e in s.entries() do
+            if e.name.starts_with("env.") do
+                p.env(e.name.slice(4), e.value)
+            end
+        end
+        added += 1
+    end
+    c.order()
+    return added
+end
+
+# Reads a .cw file into a new Clutch.
+function from_file(string path) returns Clutch
+    var c = Clutch()
+    load(c, cogwheel.confile(path))
+    return c
+end
+
+# The command line: `flywheel run cli.fw -- COMMAND [clutch.cw]`.
+#   up [file]            start everything and supervise it here
+#   serve [file] [port]  the same, with control requests on a port (default 7979)
+#   status|start|stop|restart|logs [name] [port]   talk to a serving clutch
+#   shutdown [port]      stop a serving clutch and its processes
+#   check [file]         read the file and print the start order
+function main(string[] args) returns int
+    var command = args[0] if args.length > 0 else "up"
+    var arg = args[1] if args.length > 1 else ""
+    if command == "up" or command == "check" or command == "serve" do
+        var file = arg if arg != "" else "clutch.cw"
+        var c = from_file(file)
+        if command == "check" do
+            print "{file}: start order {" -> ".join(c.order().map(function(Process p) => p.name))}"
+            return 0
+        end
+        if command == "serve" do
+            c.serve(int(args[2]) if args.length > 2 else 7979)
+        else do
+            c.up()
+        end
+        return 0
+    end
+    var port = 7979
+    if args.length > 2 do
+        port = int(args[2])
+    else if command == "shutdown" and arg != "" do
+        port = int(arg)
+    end
+    var cl = client(port)
+    try
+        if command == "status" do
+            for p in cl.status() do
+                bool live = p.state == "running" or p.state == "starting"
+                var pid = string(p.pid) if live else "-"
+                var up = format_duration(p.uptime) if live else "-"
+                var line = "{p.name:<16} {p.state:<9} pid {pid:<8} up {up:<9} restarts {p.restarts:<4} {p.message}"
+                if arg == "" or p.name == arg do
+                    print line
+                end
+            end
+        else if command == "start" or command == "stop" or command == "restart" do
+            if arg == "" do
+                print "usage: clutch {command} NAME [port]"
+                return 2
+            end
+            var r = cl.start(arg) if command == "start" else (cl.stop(arg) if command == "stop" else cl.restart(arg))
+            print "{arg}: {r.state}"
+        else if command == "logs" do
+            print cl.logs(arg)
+        else if command == "shutdown" do
+            cl.shutdown()
+            print "clutch: shut down"
+        else do
+            print "usage: clutch [up|serve|check] [file.cw] | [status|start|stop|restart|logs] [name] [port] | shutdown [port]"
+            return 2
+        end
+    catch HttpError e
+        print "clutch: no clutch is serving on port {port} ({e.message})"
+        return 1
+    catch Error e
+        print "clutch: {e.message}"
+        return 1
+    end
+    return 0
+end
