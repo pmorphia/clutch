@@ -12,3 +12,6 @@ cogwheel = "danny.cogwheel=^1.0"
 
 [scripts]
 test = "flywheel test tests/"
+
+[commands]
+clutch = "cli.fw"

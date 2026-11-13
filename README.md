@@ -114,20 +114,19 @@ arguments; quotes group them) or a `shell` line, and optionally `cwd`, `log`, `r
 go to every process. `clutch.from_file(path)` reads one into a `Clutch`, and
 `clutch.load(c, document)` adds a document's processes to yours.
 
-From a project that has the package installed:
+The `clutch` command comes with the package: `pulley install danny.clutch` puts it on your
+`PATH`, and in a project that depends on Clutch, `pulley run clutch ...` runs it (as do the
+project's `[scripts]`).
 
 ```sh
-flywheel run .flywheel-modules/clutch/cli.fw -- up clutch.cw        # here, until Ctrl-C
-flywheel run .flywheel-modules/clutch/cli.fw -- serve clutch.cw     # with control requests on port 7979
-flywheel run .flywheel-modules/clutch/cli.fw -- status              # from another terminal
-flywheel run .flywheel-modules/clutch/cli.fw -- restart api
-flywheel run .flywheel-modules/clutch/cli.fw -- logs api
-flywheel run .flywheel-modules/clutch/cli.fw -- shutdown
-flywheel run .flywheel-modules/clutch/cli.fw -- check clutch.cw     # print the start order
+clutch up clutch.cw        # here, until Ctrl-C
+clutch serve clutch.cw     # with control requests on port 7979
+clutch status              # from another terminal
+clutch restart api
+clutch logs api
+clutch shutdown
+clutch check clutch.cw     # print the start order
 ```
-
-A `[scripts]` entry in your `pulley.toml` shortens that: `clutch = "flywheel run
-.flywheel-modules/clutch/cli.fw --"`, then `pulley run clutch status`.
 
 ## Development
 

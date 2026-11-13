@@ -1,4 +1,5 @@
-# The clutch command: flywheel run cli.fw -- COMMAND ...
+# The clutch command (`pulley install danny.clutch`; `pulley run clutch` in a project that depends
+# on it): clutch COMMAND ...
 #   up [clutch.cw] | serve [clutch.cw] [port] | check [clutch.cw]
 #   status|start|stop|restart|logs [name] [port] | shutdown [port]
 import clutch
