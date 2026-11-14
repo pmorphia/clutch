@@ -1,4 +1,4 @@
-# flywheel test tests/
+# flywheel --test tests/
 import "../clutch.fw"
 import cogwheel
 import testing

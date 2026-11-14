@@ -5,7 +5,7 @@ programs in dependency order, waits until each is ready, restarts the ones that 
 lets you control them while they run.
 
 ```sh
-pulley add danny.clutch
+pulley add polymorphia.clutch
 ```
 
 ```flywheel
@@ -14,8 +14,8 @@ import clutch
 var c = clutch.Clutch()
 c.env("APP_ENV", "production")                          # for every process
 c.add("db", ["redis-server", "--port", "6380"]).ready_port(6380)
-c.add("api", ["flywheel", "run", "api.fw"]).after("db").env("PORT", "9000").log("logs/api.log")
-c.add("worker", ["flywheel", "run", "worker.fw"]).after("db").restart("always")
+c.add("api", ["flywheel", "api.fw"]).after("db").env("PORT", "9000").log("logs/api.log")
+c.add("worker", ["flywheel", "worker.fw"]).after("db").restart("always")
 c.shell("assets", "npm run watch | tee logs/assets.log")
 c.up()          # start everything, supervise it, and stop it all when supervision ends
 ```
@@ -94,7 +94,7 @@ The processes can be written in a [Cogwheel](https://github.com/pmorphia/cogwhee
 
 Serves the API on port 9000.
 
-> command = flywheel run api.fw
+> command = flywheel api.fw
 
 > after = db
 
@@ -114,7 +114,7 @@ arguments; quotes group them) or a `shell` line, and optionally `cwd`, `log`, `r
 go to every process. `clutch.from_file(path)` reads one into a `Clutch`, and
 `clutch.load(c, document)` adds a document's processes to yours.
 
-The `clutch` command comes with the package: `pulley install danny.clutch` puts it on your
+The `clutch` command comes with the package: `pulley install polymorphia.clutch` puts it on your
 `PATH`, and in a project that depends on Clutch, `pulley run clutch ...` runs it (as do the
 project's `[scripts]`).
 
@@ -131,7 +131,7 @@ clutch check clutch.cw     # print the start order
 ## Development
 
 ```sh
-flywheel test tests/
+flywheel --test tests/
 ```
 
 MIT license.

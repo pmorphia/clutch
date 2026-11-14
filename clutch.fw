@@ -4,8 +4,8 @@
 #     import clutch
 #     var c = clutch.Clutch()
 #     c.add("db", ["redis-server", "--port", "6380"]).ready_port(6380)
-#     c.add("api", ["flywheel", "run", "api.fw"]).after("db").env("REDIS", "127.0.0.1:6380")
-#     c.add("worker", ["flywheel", "run", "worker.fw"]).after("db").restart("always")
+#     c.add("api", ["flywheel", "api.fw"]).after("db").env("REDIS", "127.0.0.1:6380")
+#     c.add("worker", ["flywheel", "worker.fw"]).after("db").restart("always")
 #     c.up()             # start everything and supervise it until it is shut down
 #
 # Processes can also come from a Cogwheel file (clutch.run_file("clutch.cw")). See
@@ -716,7 +716,7 @@ function from_file(string path) returns Clutch
     return c
 end
 
-# The command line: `flywheel run cli.fw -- COMMAND [clutch.cw]`.
+# The command line: `flywheel cli.fw -- COMMAND [clutch.cw]`.
 #   up [file]            start everything and supervise it here
 #   serve [file] [port]  the same, with control requests on a port (default 7979)
 #   status|start|stop|restart|logs [name] [port]   talk to a serving clutch
